@@ -23,8 +23,8 @@ To run this project, you need to have Python installed on your system. Follow th
 
 1. Clone the repository:
    ```bash
-   git clone https://github.com/your-username/medical-image-classification.git
-   cd medical-image-classification
+   git clone https://github.com/hassancodeanwar/AI-PoweredPneumoniaDiagnosis.git
+   cd AI-PoweredPneumoniaDiagnosis
    ```
 
 2. Create a virtual environment and activate it:
@@ -45,7 +45,7 @@ To use the pipeline, follow these steps:
 2. Update the `BASE_PATH` and `LABELS_PATH` variables in the `main()` function to point to your dataset and labels file.
 3. Run the script:
    ```bash
-   python main.py
+   python model.py
    ```
 4. The script will process the data, build the model, and train it. The best model will be saved as `best_model.h5`.
 
