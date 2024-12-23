@@ -19,6 +19,11 @@ from tensorflow.keras.preprocessing.image import ImageDataGenerator
 # Visualization
 import matplotlib.pyplot as plt
 import seaborn as sns
+from tensorflow.keras import backend as K
+K.clear_session()
+from tensorflow.keras import mixed_precision
+policy = mixed_precision.Policy('mixed_float16')
+mixed_precision.set_global_policy(policy)
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 warnings.filterwarnings("ignore")
@@ -27,7 +32,7 @@ def load_config() -> Dict:
     """Load configuration for the pipeline."""
     return {
         "img_size": (128, 128),
-        "batch_size": 512,
+        "batch_size": 32,  # Reduced batch size
         "epochs": 1000,
         "learning_rate": 1e-4,
         "dropout_rate": 0.4
