@@ -1,224 +1,157 @@
-import time
 import os
-import pathlib
-from typing import List, Dict, Tuple
+import time
 import warnings
-import logging
-
-# Data handling
+from typing import List, Dict, Tuple, Optional
+from dataclasses import dataclass
+import numpy as np
 import pandas as pd
-from sklearn.model_selection import train_test_split
-
-# Deep learning
+from PIL import Image
 import tensorflow as tf
-from tensorflow.keras import layers, regularizers, Model
+from sklearn.model_selection import train_test_split
+from imblearn.over_sampling import RandomOverSampler
+from sklearn.utils import resample
+from sklearn.metrics import classification_report, confusion_matrix
+import seaborn as sns
+import matplotlib.pyplot as plt
+from tensorflow.keras.models import Model
 from tensorflow.keras.applications import VGG19
+from tensorflow.keras.layers import Dense, GlobalAveragePooling2D, Dropout
 from tensorflow.keras.callbacks import ModelCheckpoint, EarlyStopping, ReduceLROnPlateau
 from tensorflow.keras.preprocessing.image import ImageDataGenerator
 
-# Visualization
-import matplotlib.pyplot as plt
-import seaborn as sns
-from tensorflow.keras import backend as K
-K.clear_session()
-from tensorflow.keras import mixed_precision
-policy = mixed_precision.Policy('mixed_float16')
-mixed_precision.set_global_policy(policy)
-
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+# Suppress warnings
 warnings.filterwarnings("ignore")
 
-def load_config() -> Dict:
-    """Load configuration for the pipeline."""
-    return {
-        "img_size": (128, 128),
-        "batch_size": 32,  # Reduced batch size
-        "epochs": 1000,
-        "learning_rate": 1e-4,
-        "dropout_rate": 0.4
-    }
+@dataclass
+class DatasetConfig:
+    """Configuration for dataset processing."""
+    base_path: str
+    labels_path: str
+    dir_numbers: List[str]
+    train_size: float = 0.7
+    val_size: float = 0.2
+    random_state: int = 42
 
-def visualize_class_distribution(labels_df: pd.DataFrame):
-    """Plot the class distribution."""
-    label_counts = labels_df['Finding Labels'].explode().value_counts()
-    sns.barplot(x=label_counts.index, y=label_counts.values)
-    plt.title('Class Distribution')
-    plt.xticks(rotation=90)
-    plt.ylabel('Frequency')
-    plt.show()
+class MedicalImageProcessor:
+    def __init__(self, config: DatasetConfig):
+        self.config = config
+        self.processed_df: Optional[pd.DataFrame] = None
+        self.balanced_df: Optional[pd.DataFrame] = None
+        self._validate_paths()
 
-def show_sample_images(image_paths: List[str]):
-    """Display a few sample images."""
-    fig, axes = plt.subplots(1, 5, figsize=(20, 5))
-    for ax, img_path in zip(axes, image_paths[:5]):
-        img = plt.imread(img_path)
-        ax.imshow(img, cmap='gray')
-        ax.axis('off')
-    plt.show()
+    def _validate_paths(self) -> None:
+        if not os.path.exists(self.config.base_path):
+            raise FileNotFoundError(f"Base path not found: {self.config.base_path}")
+        if not os.path.exists(self.config.labels_path):
+            raise FileNotFoundError(f"Labels file not found: {self.config.labels_path}")
 
-def create_directory_paths(base_path: str, dir_numbers: List[str]) -> Dict[str, str]:
-    """Create and validate directory paths."""
-    return {
-        num: os.path.join(base_path, f"images_{num}", "images")
-        for num in dir_numbers
-        if os.path.exists(os.path.join(base_path, f"images_{num}", "images"))
-    }
+    def process_dataset(self) -> pd.DataFrame:
+        dir_paths = [os.path.join(self.config.base_path, f"images_{num}", "images") for num in self.config.dir_numbers]
+        image_data = [(os.path.join(p, f), f) for p in dir_paths for f in os.listdir(p) if os.path.isfile(os.path.join(p, f))]
+        image_df = pd.DataFrame(image_data, columns=['Image_Path', 'Image_Name'])
+        labels = pd.read_csv(self.config.labels_path)
+        merged_df = pd.merge(image_df, labels[['Image Index', 'Finding Labels']], left_on='Image_Name', right_on='Image Index', how='left').drop(columns=['Image Index'])
+        merged_df['Finding Labels'] = merged_df['Finding Labels'].apply(lambda x: x.split('|'))
+        for label in set(label for labels in merged_df['Finding Labels'] for label in labels):
+            merged_df[label] = merged_df['Finding Labels'].apply(lambda x: 1 if label in x else 0)
+        self.processed_df = merged_df
+        return self.processed_df
 
-def get_image_paths(paths: List[str]) -> List[Tuple[str, str]]:
-    """Get valid image file paths."""
-    valid_extensions = {'.jpg', '.jpeg', '.png'}
-    return [
-        (os.path.join(path, img_name), img_name)
-        for path in paths
-        for img_name in os.listdir(path)
-        if os.path.splitext(img_name)[1].lower() in valid_extensions
-    ]
+    def balance_dataset(self, strategy: str = "oversample") -> pd.DataFrame:
+        if self.processed_df is None:
+            raise ValueError("Process dataset first.")
+        label_cols = [col for col in self.processed_df.columns if col not in ['Image_Path', 'Image_Name', 'Finding Labels']]
+        self.processed_df['Label_Class'] = self.processed_df[label_cols].idxmax(axis=1)
 
-def process_labels(df: pd.DataFrame, 
-                   labels_df: pd.DataFrame) -> pd.DataFrame:
-    """Process and merge labels from CSV file."""
-    merged_df = pd.merge(
-        df, labels_df[['Image Index', 'Finding Labels']],
-        left_on='Image_Name', right_on='Image Index', how='left'
-    )
-    merged_df.fillna('No Finding', inplace=True)
+        if strategy == "oversample":
+            oversampler = RandomOverSampler(random_state=self.config.random_state)
+            X_res, y_res = oversampler.fit_resample(self.processed_df.drop(columns=['Label_Class']), self.processed_df['Label_Class'])
+            self.balanced_df = pd.concat([X_res, y_res], axis=1)
+        elif strategy == "undersample":
+            min_class_size = self.processed_df['Label_Class'].value_counts().min()
+            self.balanced_df = pd.concat([resample(self.processed_df[self.processed_df['Label_Class'] == cls], replace=False, n_samples=min_class_size, random_state=self.config.random_state) for cls in self.processed_df['Label_Class'].unique()])
+        else:
+            raise ValueError("Invalid strategy. Use 'oversample' or 'undersample'")
+        return self.balanced_df
 
-    all_labels = set(label for labels in merged_df['Finding Labels'] for label in labels.split('|'))
-    for label in all_labels:
-        merged_df[label] = merged_df['Finding Labels'].apply(lambda x: int(label in x.split('|')))
+    def split_dataset(self) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+        label_cols = [col for col in self.balanced_df.columns if col not in ['Image_Path', 'Image_Name', 'Finding Labels', 'Label_Class']]
+        train, temp = train_test_split(self.balanced_df, train_size=self.config.train_size, stratify=self.balanced_df[label_cols].sum(axis=1), random_state=self.config.random_state)
+        val_size_adjusted = self.config.val_size / (1 - self.config.train_size)
+        val, test = train_test_split(temp, train_size=val_size_adjusted, stratify=temp[label_cols].sum(axis=1), random_state=self.config.random_state)
+        return train, val, test
 
-    return merged_df.drop(columns='Image Index', errors='ignore')
+class ModelTrainer:
+    def __init__(self, num_classes: int, input_shape: Tuple[int, int, int] = (224, 224, 3), batch_size: int = 32, epochs: int = 50, learning_rate: float = 0.0001, model_save_path: str = 'models'):
+        self.num_classes = num_classes
+        self.input_shape = input_shape
+        self.batch_size = batch_size
+        self.epochs = epochs
+        self.learning_rate = learning_rate
+        self.model_save_path = model_save_path
+        self.model = None
+        os.makedirs(model_save_path, exist_ok=True)
 
-def build_model(config: Dict, 
-                num_classes: int) -> Model:
-    """Build the model architecture."""
-    base_model = VGG19(include_top=False, weights='imagenet', input_shape=(*config["img_size"], 3))
+    def build_model(self) -> Model:
+        base_model = VGG19(weights='imagenet', include_top=False, input_shape=self.input_shape)
+        for layer in base_model.layers:
+            layer.trainable = False
+        x = GlobalAveragePooling2D()(base_model.output)
+        x = Dense(1024, activation='relu')(x)
+        x = Dropout(0.5)(x)
+        x = Dense(512, activation='relu')(x)
+        x = Dropout(0.3)(x)
+        predictions = Dense(self.num_classes, activation='sigmoid')(x)
+        self.model = Model(inputs=base_model.input, outputs=predictions)
+        self.model.compile(optimizer=tf.keras.optimizers.Adam(learning_rate=self.learning_rate), loss='binary_crossentropy', metrics=['accuracy', tf.keras.metrics.AUC()])
+        return self.model
 
-    # Unfreeze the last 128 layers
-    for layer in base_model.layers[:-128]:
-        layer.trainable = False
-    for layer in base_model.layers[-128:]:
-        layer.trainable = True
+    def train(self, train_df: pd.DataFrame, val_df: pd.DataFrame, label_cols: List[str]) -> Dict:
+        train_gen = ImageDataGenerator(preprocessing_function=tf.keras.applications.vgg19.preprocess_input, rotation_range=20, width_shift_range=0.2, height_shift_range=0.2, shear_range=0.2, zoom_range=0.2, horizontal_flip=True).flow_from_dataframe(train_df, x_col='Image_Path', y_col=label_cols, target_size=self.input_shape[:2], batch_size=self.batch_size, class_mode='raw')
+        val_gen = ImageDataGenerator(preprocessing_function=tf.keras.applications.vgg19.preprocess_input).flow_from_dataframe(val_df, x_col='Image_Path', y_col=label_cols, target_size=self.input_shape[:2], batch_size=self.batch_size, class_mode='raw')
+        callbacks = [
+            ModelCheckpoint(filepath=os.path.join(self.model_save_path, 'model_best.h5'), monitor='val_accuracy', save_best_only=True),
+            EarlyStopping(monitor='val_loss', patience=10, restore_best_weights=True),
+            ReduceLROnPlateau(monitor='val_loss', factor=0.2, patience=5, min_lr=1e-6)]
+        self.history = self.model.fit(train_gen, validation_data=val_gen, epochs=self.epochs, callbacks=callbacks)
+        return self.history.history
 
-    inputs = layers.Input(shape=(*config["img_size"], 3))
-    x = base_model(inputs)
-    x = layers.GlobalAveragePooling2D()(x)
-
-    for units in [8196, 4096, 2048, 1024, 512]:
-        x = layers.Dense(units, activation='relu', kernel_regularizer=regularizers.l2(0.0001))(x)
-        x = layers.BatchNormalization()(x)
-
-    x = layers.Dropout(config["dropout_rate"])(x)
-    outputs = layers.Dense(num_classes, activation='sigmoid')(x)
-
-    model = Model(inputs, outputs)
-    model.compile(
-        optimizer=tf.keras.optimizers.Adam(config["learning_rate"]),
-        loss='binary_crossentropy',
-        metrics=['accuracy', tf.keras.metrics.AUC()]
-    )
-    return model
-
-def create_generators(config: Dict, 
-                      train_df: pd.DataFrame, 
-                      val_df: pd.DataFrame, 
-                      test_df: pd.DataFrame, 
-                      label_columns: List[str]):
-    """Create data generators."""
-    train_datagen = ImageDataGenerator(
-        preprocessing_function=tf.keras.applications.vgg19.preprocess_input,
-        rotation_range=20, width_shift_range=0.2, height_shift_range=0.2,
-        horizontal_flip=True, zoom_range=0.2, fill_mode='nearest'
-    )
-    val_datagen = ImageDataGenerator(preprocessing_function=tf.keras.applications.vgg19.preprocess_input)
-
-    def flow_data(datagen, df):
-        return datagen.flow_from_dataframe(
-            df, x_col='Image_Path', y_col=label_columns,
-            target_size=config["img_size"], batch_size=config["batch_size"], class_mode='raw'
-        )
-
-    return flow_data(train_datagen, train_df), flow_data(val_datagen, val_df), flow_data(val_datagen, test_df)
-
-def train_model(model: Model, train_gen, val_gen, config: Dict):
-    """Train the model."""
-    callbacks = [
-        ModelCheckpoint('best_model.keras', save_best_only=True, monitor='val_loss', verbose=1),
-        EarlyStopping(monitor='val_loss', patience=50, restore_best_weights=True, verbose=1),
-        ReduceLROnPlateau(monitor='val_loss', factor=0.2, patience=5, min_lr=1e-6, verbose=1)
-    ]
-    return model.fit(train_gen, validation_data=val_gen, epochs=config["epochs"], callbacks=callbacks, verbose=1)
+    def evaluate(self, test_df: pd.DataFrame, label_cols: List[str]) -> Tuple[float, float]:
+        test_gen = ImageDataGenerator(preprocessing_function=tf.keras.applications.vgg19.preprocess_input).flow_from_dataframe(test_df, x_col='Image_Path', y_col=label_cols, target_size=self.input_shape[:2], batch_size=self.batch_size, class_mode='raw')
+        return self.model.evaluate(test_gen)
 
 def main():
-    logging.info('Pipeline started.')
-    start_time = time.time()
-    print("\n............................................\n")
-    print("Loading configuration...")
-    config = load_config()
-    print("Configuration loaded.")
+    print("Initializing configuration...")
+    config = DatasetConfig(base_path='/kaggle/input/data', labels_path='/kaggle/input/data/Data_Entry_2017.csv', dir_numbers=[f"{i:03d}" for i in range(1, 13)])
 
-    BASE_PATH = '/kaggle/input/data'
-    LABELS_PATH = os.path.join(BASE_PATH, 'Data_Entry_2017.csv')
-    DIR_NUMBERS = [f"{i:03d}" for i in range(1, 13)]
-    print("\n............................................\n")
-    print("Reading labels file...")
-    labels_df = pd.read_csv(LABELS_PATH)
-    print("Labels file loaded.")
-    
-    print("\n............................................\n")
+    print("Processing dataset...")
+    processor = MedicalImageProcessor(config)
+    processed_df = processor.process_dataset()
+    print("Dataset processed.")
 
-    print("Creating directory paths...")
-    dir_paths = create_directory_paths(BASE_PATH, DIR_NUMBERS)
-    print(f"Directory paths created: {len(dir_paths)} directories found.")
-    print("\n............................................\n")
+    print("Balancing dataset...")
+    balanced_df = processor.balance_dataset()
+    print("Dataset balanced.")
 
-    print("Extracting image paths...")
-    image_data = get_image_paths(list(dir_paths.values()))
-    print(f"Image paths extracted: {len(image_data)} images found.")
-    print("\n............................................\n")
+    print("Splitting dataset...")
+    train_df, val_df, test_df = processor.split_dataset()
+    print("Dataset split into train, validation, and test sets.")
 
-    print("Creating DataFrame for images...")
-    image_df = pd.DataFrame(image_data, columns=['Image_Path', 'Image_Name'])
-    print("Image DataFrame created.")
-    print("\n............................................\n")
-
-    print("Processing labels...")
-    processed_df = process_labels(image_df, labels_df)
-    label_columns = [col for col in processed_df.columns if col not in ['Image_Path', 'Image_Name', 'Finding Labels']]
-    print(f"Labels processed. Total classes: {len(label_columns)}.")
-    print("\n............................................\n")
-
-    # print("Visualizing class distribution...")
-    # visualize_class_distribution(processed_df)
-
-    print("Displaying sample images...")
-    show_sample_images([img[0] for img in image_data])
-    print("\n............................................\n")
-
-    print("Splitting data into train, validation, and test sets...")
-    train_df, temp_df = train_test_split(processed_df, train_size=0.7, random_state=42)
-    val_df, test_df = train_test_split(temp_df, train_size=0.5, random_state=42)
-    print("Data split completed.")
-    print("\n............................................\n")
+    print("Preparing model trainer...")
+    label_cols = [col for col in balanced_df.columns if col not in ['Image_Path', 'Image_Name', 'Finding Labels', 'Label_Class']]
+    trainer = ModelTrainer(num_classes=len(label_cols))
 
     print("Building model...")
-    model = build_model(config, len(label_columns))
+    trainer.build_model()
     print("Model built.")
-    print("\n............................................\n")
-
-    print("Creating data generators...")
-    train_gen, val_gen, test_gen = create_generators(config, train_df, val_df, test_df, label_columns)
-    print("Data generators created.")
 
     print("Training model...")
-    history = train_model(model, train_gen, val_gen, config)
-    print("Model training completed.")
-    print("\n............................................\n")
+    trainer.train(train_df, val_df, label_cols)
+    print("Model trained.")
 
-    end_time = time.time()
-    logging.info(f'Pipeline completed successfully in {end_time - start_time:.2f} seconds.')
-    print(f"Pipeline completed successfully in {end_time - start_time:.2f} seconds.")
-    print("\n............................................\n")
+    print("Evaluating model...")
+    loss, accuracy = trainer.evaluate(test_df, label_cols)
+    print(f"Test Loss: {loss}, Test Accuracy: {accuracy}")
 
 if __name__ == "__main__":
     main()
