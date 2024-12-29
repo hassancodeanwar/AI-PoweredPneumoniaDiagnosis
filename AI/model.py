@@ -1,157 +1,259 @@
-import os
 import time
+import os
+import pathlib
+from typing import List, Dict, Tuple
 import warnings
-from typing import List, Dict, Tuple, Optional
-from dataclasses import dataclass
-import numpy as np
+import logging
+
+# Data handling
 import pandas as pd
-from PIL import Image
-import tensorflow as tf
 from sklearn.model_selection import train_test_split
-from imblearn.over_sampling import RandomOverSampler
-from sklearn.utils import resample
-from sklearn.metrics import classification_report, confusion_matrix
-import seaborn as sns
-import matplotlib.pyplot as plt
-from tensorflow.keras.models import Model
-from tensorflow.keras.applications import VGG19
-from tensorflow.keras.layers import Dense, GlobalAveragePooling2D, Dropout
+
+# Deep learning
+import tensorflow as tf
+from tensorflow.keras import layers, regularizers, Model
+from tensorflow.keras.applications import EfficientNetB0
 from tensorflow.keras.callbacks import ModelCheckpoint, EarlyStopping, ReduceLROnPlateau
 from tensorflow.keras.preprocessing.image import ImageDataGenerator
 
-# Suppress warnings
+# Visualization
+import matplotlib.pyplot as plt
+import seaborn as sns
+from tensorflow.keras import backend as K
+K.clear_session()
+from tensorflow.keras import mixed_precision
+policy = mixed_precision.Policy('mixed_float16')
+mixed_precision.set_global_policy(policy)
+
+# Enable XLA optimization
+tf.config.optimizer.set_jit(True)
+
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 warnings.filterwarnings("ignore")
 
-@dataclass
-class DatasetConfig:
-    """Configuration for dataset processing."""
-    base_path: str
-    labels_path: str
-    dir_numbers: List[str]
-    train_size: float = 0.7
-    val_size: float = 0.2
-    random_state: int = 42
+def load_config() -> Dict:
+    """Load configuration for the pipeline."""
+    return {
+        "img_size": (224, 224),
+        "batch_size": 128,
+        "epochs": 300,
+        "learning_rate": 1e-3,
+        "dropout_rate": 0.009,
+        "validation_split": 0.15,
+        "test_split": 0.15
+    }
 
-class MedicalImageProcessor:
-    def __init__(self, config: DatasetConfig):
-        self.config = config
-        self.processed_df: Optional[pd.DataFrame] = None
-        self.balanced_df: Optional[pd.DataFrame] = None
-        self._validate_paths()
+def visualize_class_distribution(labels_df: pd.DataFrame):
+    """Plot the class distribution."""
+    label_counts = labels_df['Finding Labels'].explode().value_counts()
+    sns.barplot(x=label_counts.index, y=label_counts.values)
+    plt.title('Class Distribution')
+    plt.xticks(rotation=90)
+    plt.ylabel('Frequency')
+    plt.show()
 
-    def _validate_paths(self) -> None:
-        if not os.path.exists(self.config.base_path):
-            raise FileNotFoundError(f"Base path not found: {self.config.base_path}")
-        if not os.path.exists(self.config.labels_path):
-            raise FileNotFoundError(f"Labels file not found: {self.config.labels_path}")
+def show_sample_images(image_paths: List[str]):
+    """Display a few sample images."""
+    fig, axes = plt.subplots(1, 5, figsize=(20, 5))
+    for ax, img_path in zip(axes, image_paths[:5]):
+        img = plt.imread(img_path)
+        ax.imshow(img, cmap='gray')
+        ax.axis('off')
+    plt.show()
 
-    def process_dataset(self) -> pd.DataFrame:
-        dir_paths = [os.path.join(self.config.base_path, f"images_{num}", "images") for num in self.config.dir_numbers]
-        image_data = [(os.path.join(p, f), f) for p in dir_paths for f in os.listdir(p) if os.path.isfile(os.path.join(p, f))]
-        image_df = pd.DataFrame(image_data, columns=['Image_Path', 'Image_Name'])
-        labels = pd.read_csv(self.config.labels_path)
-        merged_df = pd.merge(image_df, labels[['Image Index', 'Finding Labels']], left_on='Image_Name', right_on='Image Index', how='left').drop(columns=['Image Index'])
-        merged_df['Finding Labels'] = merged_df['Finding Labels'].apply(lambda x: x.split('|'))
-        for label in set(label for labels in merged_df['Finding Labels'] for label in labels):
-            merged_df[label] = merged_df['Finding Labels'].apply(lambda x: 1 if label in x else 0)
-        self.processed_df = merged_df
-        return self.processed_df
+def create_directory_paths(base_path: str, dir_numbers: List[str]) -> Dict[str, str]:
+    """Create and validate directory paths."""
+    return {
+        num: os.path.join(base_path, f"images_{num}", "images")
+        for num in dir_numbers
+        if os.path.exists(os.path.join(base_path, f"images_{num}", "images"))
+    }
 
-    def balance_dataset(self, strategy: str = "oversample") -> pd.DataFrame:
-        if self.processed_df is None:
-            raise ValueError("Process dataset first.")
-        label_cols = [col for col in self.processed_df.columns if col not in ['Image_Path', 'Image_Name', 'Finding Labels']]
-        self.processed_df['Label_Class'] = self.processed_df[label_cols].idxmax(axis=1)
+def get_image_paths(paths: List[str]) -> List[Tuple[str, str]]:
+    """Get valid image file paths."""
+    valid_extensions = {'.jpg', '.jpeg', '.png'}
+    return [
+        (os.path.join(path, img_name), img_name)
+        for path in paths
+        for img_name in os.listdir(path)
+        if os.path.splitext(img_name)[1].lower() in valid_extensions
+    ]
 
-        if strategy == "oversample":
-            oversampler = RandomOverSampler(random_state=self.config.random_state)
-            X_res, y_res = oversampler.fit_resample(self.processed_df.drop(columns=['Label_Class']), self.processed_df['Label_Class'])
-            self.balanced_df = pd.concat([X_res, y_res], axis=1)
-        elif strategy == "undersample":
-            min_class_size = self.processed_df['Label_Class'].value_counts().min()
-            self.balanced_df = pd.concat([resample(self.processed_df[self.processed_df['Label_Class'] == cls], replace=False, n_samples=min_class_size, random_state=self.config.random_state) for cls in self.processed_df['Label_Class'].unique()])
-        else:
-            raise ValueError("Invalid strategy. Use 'oversample' or 'undersample'")
-        return self.balanced_df
+def build_model(config: Dict, num_classes: int) -> Model:
+    """Build the model architecture using EfficientNet."""
+    base_model = EfficientNetB0(include_top=False, weights='imagenet', 
+                               input_shape=(*config["img_size"], 3))
+    
+    # Freeze only the first 90% of layers
+    freeze_layers = int(len(base_model.layers) * 0.9)
+    for layer in base_model.layers[:freeze_layers]:
+        layer.trainable = False
+    for layer in base_model.layers[freeze_layers:]:
+        layer.trainable = True
 
-    def split_dataset(self) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
-        label_cols = [col for col in self.balanced_df.columns if col not in ['Image_Path', 'Image_Name', 'Finding Labels', 'Label_Class']]
-        train, temp = train_test_split(self.balanced_df, train_size=self.config.train_size, stratify=self.balanced_df[label_cols].sum(axis=1), random_state=self.config.random_state)
-        val_size_adjusted = self.config.val_size / (1 - self.config.train_size)
-        val, test = train_test_split(temp, train_size=val_size_adjusted, stratify=temp[label_cols].sum(axis=1), random_state=self.config.random_state)
-        return train, val, test
+    inputs = layers.Input(shape=(*config["img_size"], 3))
+    x = base_model(inputs)
+    x = layers.GlobalAveragePooling2D()(x)
+    
+    # Simplified dense layers
+    for units in [2048, 1024, 512]:
+        x = layers.Dense(units, activation='relu')(x)
+        x = layers.BatchNormalization()(x)
+        x = layers.Dropout(config["dropout_rate"])(x)
 
-class ModelTrainer:
-    def __init__(self, num_classes: int, input_shape: Tuple[int, int, int] = (224, 224, 3), batch_size: int = 32, epochs: int = 50, learning_rate: float = 0.0001, model_save_path: str = 'models'):
-        self.num_classes = num_classes
-        self.input_shape = input_shape
-        self.batch_size = batch_size
-        self.epochs = epochs
-        self.learning_rate = learning_rate
-        self.model_save_path = model_save_path
-        self.model = None
-        os.makedirs(model_save_path, exist_ok=True)
+    outputs = layers.Dense(num_classes, activation='sigmoid')(x)
 
-    def build_model(self) -> Model:
-        base_model = VGG19(weights='imagenet', include_top=False, input_shape=self.input_shape)
-        for layer in base_model.layers:
-            layer.trainable = False
-        x = GlobalAveragePooling2D()(base_model.output)
-        x = Dense(1024, activation='relu')(x)
-        x = Dropout(0.5)(x)
-        x = Dense(512, activation='relu')(x)
-        x = Dropout(0.3)(x)
-        predictions = Dense(self.num_classes, activation='sigmoid')(x)
-        self.model = Model(inputs=base_model.input, outputs=predictions)
-        self.model.compile(optimizer=tf.keras.optimizers.Adam(learning_rate=self.learning_rate), loss='binary_crossentropy', metrics=['accuracy', tf.keras.metrics.AUC()])
-        return self.model
+    model = Model(inputs, outputs)
+    
+    # Use mixed precision optimizer
+    optimizer = tf.keras.optimizers.Adam(config["learning_rate"])
+    optimizer = mixed_precision.LossScaleOptimizer(optimizer)
+    
+    model.compile(
+        optimizer=optimizer,
+        loss='binary_crossentropy',
+        metrics=['accuracy', tf.keras.metrics.AUC()]
+    )
+    return model
 
-    def train(self, train_df: pd.DataFrame, val_df: pd.DataFrame, label_cols: List[str]) -> Dict:
-        train_gen = ImageDataGenerator(preprocessing_function=tf.keras.applications.vgg19.preprocess_input, rotation_range=20, width_shift_range=0.2, height_shift_range=0.2, shear_range=0.2, zoom_range=0.2, horizontal_flip=True).flow_from_dataframe(train_df, x_col='Image_Path', y_col=label_cols, target_size=self.input_shape[:2], batch_size=self.batch_size, class_mode='raw')
-        val_gen = ImageDataGenerator(preprocessing_function=tf.keras.applications.vgg19.preprocess_input).flow_from_dataframe(val_df, x_col='Image_Path', y_col=label_cols, target_size=self.input_shape[:2], batch_size=self.batch_size, class_mode='raw')
-        callbacks = [
-            ModelCheckpoint(filepath=os.path.join(self.model_save_path, 'model_best.h5'), monitor='val_accuracy', save_best_only=True),
-            EarlyStopping(monitor='val_loss', patience=10, restore_best_weights=True),
-            ReduceLROnPlateau(monitor='val_loss', factor=0.2, patience=5, min_lr=1e-6)]
-        self.history = self.model.fit(train_gen, validation_data=val_gen, epochs=self.epochs, callbacks=callbacks)
-        return self.history.history
+def create_generators(config: Dict, train_df: pd.DataFrame, 
+                     val_df: pd.DataFrame, test_df: pd.DataFrame, 
+                     label_columns: List[str]):
+    """Create optimized data generators."""
+    train_datagen = ImageDataGenerator(
+        preprocessing_function=tf.keras.applications.efficientnet.preprocess_input,
+        rotation_range=15,
+        width_shift_range=0.1,
+        height_shift_range=0.1,
+        horizontal_flip=True,
+        fill_mode='nearest'
+    )
+    val_datagen = ImageDataGenerator(
+        preprocessing_function=tf.keras.applications.efficientnet.preprocess_input
+    )
 
-    def evaluate(self, test_df: pd.DataFrame, label_cols: List[str]) -> Tuple[float, float]:
-        test_gen = ImageDataGenerator(preprocessing_function=tf.keras.applications.vgg19.preprocess_input).flow_from_dataframe(test_df, x_col='Image_Path', y_col=label_cols, target_size=self.input_shape[:2], batch_size=self.batch_size, class_mode='raw')
-        return self.model.evaluate(test_gen)
+    def flow_data(datagen, df):
+        return datagen.flow_from_dataframe(
+            df,
+            x_col='Image_Path',
+            y_col=label_columns,
+            target_size=config["img_size"],
+            batch_size=config["batch_size"],
+            class_mode='raw',
+            shuffle=True
+        )
+
+    train_gen = flow_data(train_datagen, train_df)
+    val_gen = flow_data(val_datagen, val_df)
+    test_gen = flow_data(val_datagen, test_df)
+    
+    return train_gen, val_gen, test_gen
+
+def train_model(model: Model, train_gen, val_gen, config: Dict):
+    """Train the model with optimized callbacks."""
+    callbacks = [
+        ModelCheckpoint(
+            'best_model.keras',
+            save_best_only=True,
+            monitor='val_loss',
+            verbose=1
+        ),
+        EarlyStopping(
+            monitor='val_loss',
+            patience=10,
+            restore_best_weights=True,
+            verbose=1
+        ),
+        ReduceLROnPlateau(
+            monitor='val_loss',
+            factor=0.5,
+            patience=5,
+            min_lr=1e-6,
+            verbose=1
+        )
+    ]
+    
+    # Calculate steps per epoch based on dataset size and batch size
+    steps_per_epoch = len(train_gen.filenames) // config["batch_size"]
+    validation_steps = len(val_gen.filenames) // config["batch_size"]
+    
+    return model.fit(
+        train_gen,
+        validation_data=val_gen,
+        epochs=config["epochs"],
+        callbacks=callbacks,
+        verbose=1,
+        steps_per_epoch=steps_per_epoch,
+        validation_steps=validation_steps
+    )
 
 def main():
-    print("Initializing configuration...")
-    config = DatasetConfig(base_path='/kaggle/input/data', labels_path='/kaggle/input/data/Data_Entry_2017.csv', dir_numbers=[f"{i:03d}" for i in range(1, 13)])
+    logging.info('Pipeline started.')
+    start_time = time.time()
+    print("\n............................................\n")
+    print("Loading configuration...")
+    config = load_config()
+    print("Configuration loaded.")
 
-    print("Processing dataset...")
-    processor = MedicalImageProcessor(config)
-    processed_df = processor.process_dataset()
-    print("Dataset processed.")
+    BASE_PATH = '/kaggle/input/data'
+    LABELS_PATH = os.path.join(BASE_PATH, 'Data_Entry_2017.csv')
+    DIR_NUMBERS = [f"{i:03d}" for i in range(1, 13)]
+    print("\n............................................\n")
+    print("Reading labels file...")
+    labels_df = pd.read_csv(LABELS_PATH)
+    print("Labels file loaded.")
+    
+    print("\n............................................\n")
 
-    print("Balancing dataset...")
-    balanced_df = processor.balance_dataset()
-    print("Dataset balanced.")
+    print("Creating directory paths...")
+    dir_paths = create_directory_paths(BASE_PATH, DIR_NUMBERS)
+    print(f"Directory paths created: {len(dir_paths)} directories found.")
+    print("\n............................................\n")
 
-    print("Splitting dataset...")
-    train_df, val_df, test_df = processor.split_dataset()
-    print("Dataset split into train, validation, and test sets.")
+    print("Extracting image paths...")
+    image_data = get_image_paths(list(dir_paths.values()))
+    print(f"Image paths extracted: {len(image_data)} images found.")
+    print("\n............................................\n")
 
-    print("Preparing model trainer...")
-    label_cols = [col for col in balanced_df.columns if col not in ['Image_Path', 'Image_Name', 'Finding Labels', 'Label_Class']]
-    trainer = ModelTrainer(num_classes=len(label_cols))
+    print("Creating DataFrame for images...")
+    image_df = pd.DataFrame(image_data, columns=['Image_Path', 'Image_Name'])
+    print("Image DataFrame created.")
+    print("\n............................................\n")
+
+    print("Processing labels...")
+    processed_df = process_labels(image_df, labels_df)
+    label_columns = [col for col in processed_df.columns if col not in ['Image_Path', 'Image_Name', 'Finding Labels']]
+    print(f"Labels processed. Total classes: {len(label_columns)}.")
+    print("\n............................................\n")
+
+    print("Displaying sample images...")
+    show_sample_images([img[0] for img in image_data])
+    print("\n............................................\n")
+
+    print("Splitting data into train, validation, and test sets...")
+    train_df, temp_df = train_test_split(processed_df, train_size=0.7, random_state=42)
+    val_df, test_df = train_test_split(temp_df, train_size=0.5, random_state=42)
+    print("Data split completed.")
+    print("\n............................................\n")
 
     print("Building model...")
-    trainer.build_model()
+    model = build_model(config, len(label_columns))
     print("Model built.")
+    print("\n............................................\n")
+
+    print("Creating data generators...")
+    train_gen, val_gen, test_gen = create_generators(config, train_df, val_df, test_df, label_columns)
+    print("Data generators created.")
 
     print("Training model...")
-    trainer.train(train_df, val_df, label_cols)
-    print("Model trained.")
+    history = train_model(model, train_gen, val_gen, config)
+    print("Model training completed.")
+    print("\n............................................\n")
 
-    print("Evaluating model...")
-    loss, accuracy = trainer.evaluate(test_df, label_cols)
-    print(f"Test Loss: {loss}, Test Accuracy: {accuracy}")
+    end_time = time.time()
+    logging.info(f'Pipeline completed successfully in {end_time - start_time:.2f} seconds.')
+    print(f"Pipeline completed successfully in {end_time - start_time:.2f} seconds.")
+    print("\n............................................\n")
 
 if __name__ == "__main__":
     main()
