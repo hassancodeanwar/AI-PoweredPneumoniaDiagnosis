@@ -1,259 +1,498 @@
-import time
-import os
-import pathlib
-from typing import List, Dict, Tuple
-import warnings
-import logging
-
-# Data handling
-import pandas as pd
-from sklearn.model_selection import train_test_split
-
-# Deep learning
 import tensorflow as tf
-from tensorflow.keras import layers, regularizers, Model
-from tensorflow.keras.applications import EfficientNetB0
-from tensorflow.keras.callbacks import ModelCheckpoint, EarlyStopping, ReduceLROnPlateau
-from tensorflow.keras.preprocessing.image import ImageDataGenerator
-
-# Visualization
+import os
+import numpy as np
+import pandas as pd
 import matplotlib.pyplot as plt
 import seaborn as sns
-from tensorflow.keras import backend as K
-K.clear_session()
-from tensorflow.keras import mixed_precision
-policy = mixed_precision.Policy('mixed_float16')
-mixed_precision.set_global_policy(policy)
+from PIL import Image
+from tensorflow.keras.models import Sequential, Model
+from tensorflow.keras.layers import Dense, Flatten, Dropout, Input, Conv2D, MaxPooling2D, BatchNormalization
+from tensorflow.keras.optimizers import Adam
+from tensorflow.keras.callbacks import ReduceLROnPlateau, EarlyStopping
+from tensorflow.keras.preprocessing.image import ImageDataGenerator
+from tensorflow.keras.utils import to_categorical
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import confusion_matrix, classification_report, roc_curve, auc
+import concurrent.futures
+import multiprocessing
 
-# Enable XLA optimization
-tf.config.optimizer.set_jit(True)
+# Check GPU availability
+print("Num GPUs Available: ", len(tf.config.list_physical_devices('GPU')))
+gpus = tf.config.list_physical_devices('GPU')
+try:
+    for gpu in gpus:
+        tf.config.experimental.set_memory_growth(gpu, True)
+except Exception as e:
+    print(e)
 
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
-warnings.filterwarnings("ignore")
+# Get the number of CPU cores for parallel processing
+max_workers = multiprocessing.cpu_count()
+print(f"Number of CPU cores: {max_workers}")
 
-def load_config() -> Dict:
-    """Load configuration for the pipeline."""
-    return {
-        "img_size": (224, 224),
-        "batch_size": 128,
-        "epochs": 300,
-        "learning_rate": 1e-3,
-        "dropout_rate": 0.009,
-        "validation_split": 0.15,
-        "test_split": 0.15
-    }
+# Function to create DataFrame from image directory
+def create_dataframe(data_dir):
+    # Only use the three specified classes: Normal, Pneumonia-Bacterial, Pneumonia-Viral
+    valid_classes = ["Normal", "Pneumonia-Bacterial", "Pneumonia-Viral"]
+    
+    data = []
+    for dir_name in os.listdir(data_dir):
+        # Skip directories that aren't in our valid classes
+        if dir_name not in valid_classes:
+            continue
+            
+        # Assign labels based on class names
+        if dir_name == "Normal":
+            label = 0
+        elif dir_name == "Pneumonia-Bacterial":
+            label = 1
+        elif dir_name == "Pneumonia-Viral":
+            label = 2
+            
+        # Add images to dataframe
+        for fname in os.listdir(os.path.join(data_dir, dir_name)):
+            if fname.lower().endswith(('.png', '.jpg', '.jpeg')):
+                data.append({
+                    "image_path": os.path.join(data_dir, dir_name, fname), 
+                    "label": label
+                })
+    
+    return pd.DataFrame(data)
 
-def visualize_class_distribution(labels_df: pd.DataFrame):
-    """Plot the class distribution."""
-    label_counts = labels_df['Finding Labels'].explode().value_counts()
-    sns.barplot(x=label_counts.index, y=label_counts.values)
-    plt.title('Class Distribution')
-    plt.xticks(rotation=90)
-    plt.ylabel('Frequency')
+# Function to resize image arrays
+def resize_image_array(image_path):
+    try:
+        # Open as grayscale and keep as single channel for efficiency
+        img = Image.open(image_path).convert('L').resize((128, 128))
+        return np.asarray(img)
+    except Exception as e:
+        print(f"Error processing {image_path}: {e}")
+        # Return a blank image if there's an error
+        return np.zeros((128, 128), dtype=np.uint8)
+
+# Function to plot training history
+def plot_training_history(history):
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(15, 5))
+    
+    # Accuracy plot
+    ax1.plot(history.history['accuracy'], label='Training Accuracy')
+    ax1.plot(history.history['val_accuracy'], label='Validation Accuracy')
+    ax1.set_xlabel('Epochs')
+    ax1.set_ylabel('Accuracy')
+    ax1.set_title('Training and Validation Accuracy')
+    ax1.legend()
+    ax1.grid(True)
+    
+    # Loss plot
+    ax2.plot(history.history['loss'], label='Training Loss')
+    ax2.plot(history.history['val_loss'], label='Validation Loss')
+    ax2.set_xlabel('Epochs')
+    ax2.set_ylabel('Loss')
+    ax2.set_title('Training and Validation Loss')
+    ax2.legend()
+    ax2.grid(True)
+    
+    plt.tight_layout()
     plt.show()
 
-def show_sample_images(image_paths: List[str]):
-    """Display a few sample images."""
-    fig, axes = plt.subplots(1, 5, figsize=(20, 5))
-    for ax, img_path in zip(axes, image_paths[:5]):
-        img = plt.imread(img_path)
-        ax.imshow(img, cmap='gray')
-        ax.axis('off')
+# Function to plot confusion matrix
+def plot_confusion_matrix(y_true, y_pred, class_names):
+    cm = confusion_matrix(y_true, y_pred)
+    plt.figure(figsize=(10, 8))
+    sns.heatmap(cm, annot=True, fmt='d', cmap='Blues', xticklabels=class_names, yticklabels=class_names)
+    plt.xlabel('Predicted Labels')
+    plt.ylabel('True Labels')
+    plt.title('Confusion Matrix')
     plt.show()
 
-def create_directory_paths(base_path: str, dir_numbers: List[str]) -> Dict[str, str]:
-    """Create and validate directory paths."""
-    return {
-        num: os.path.join(base_path, f"images_{num}", "images")
-        for num in dir_numbers
-        if os.path.exists(os.path.join(base_path, f"images_{num}", "images"))
-    }
+# Function to plot data distribution
+def plot_data_distribution(class_counts, label_map):
+    plt.figure(figsize=(10, 6))
+    bars = plt.bar(list(label_map.values()), class_counts)
+    plt.xlabel('Classes')
+    plt.ylabel('Number of Images')
+    plt.title('Class Distribution in Dataset')
+    plt.tight_layout()
+    plt.show()
 
-def get_image_paths(paths: List[str]) -> List[Tuple[str, str]]:
-    """Get valid image file paths."""
-    valid_extensions = {'.jpg', '.jpeg', '.png'}
-    return [
-        (os.path.join(path, img_name), img_name)
-        for path in paths
-        for img_name in os.listdir(path)
-        if os.path.splitext(img_name)[1].lower() in valid_extensions
-    ]
-
-def build_model(config: Dict, num_classes: int) -> Model:
-    """Build the model architecture using EfficientNet."""
-    base_model = EfficientNetB0(include_top=False, weights='imagenet', 
-                               input_shape=(*config["img_size"], 3))
+# Function to plot sample images
+def plot_sample_images(df, label_map, samples_per_class=3):
+    plt.figure(figsize=(15, 5))
+    for i, class_label in enumerate(sorted(df['label'].unique())):
+        samples = df[df['label'] == class_label].sample(min(samples_per_class, len(df[df['label'] == class_label])))
+        
+        for j, (_, sample) in enumerate(samples.iterrows()):
+            plt.subplot(len(df['label'].unique()), samples_per_class, i*samples_per_class + j + 1)
+            plt.imshow(sample['image'], cmap='gray')
+            plt.title(f"{label_map[class_label]}")
+            plt.axis('off')
     
-    # Freeze only the first 90% of layers
-    freeze_layers = int(len(base_model.layers) * 0.9)
-    for layer in base_model.layers[:freeze_layers]:
-        layer.trainable = False
-    for layer in base_model.layers[freeze_layers:]:
-        layer.trainable = True
+    plt.tight_layout()
+    plt.suptitle("Sample Images from Each Class", y=1.05)
+    plt.show()
 
-    inputs = layers.Input(shape=(*config["img_size"], 3))
-    x = base_model(inputs)
-    x = layers.GlobalAveragePooling2D()(x)
+# Function to plot ROC curves
+def plot_roc_curves(y_test, y_pred_proba, num_classes, label_map):
+    plt.figure(figsize=(10, 8))
     
-    # Simplified dense layers
-    for units in [2048, 1024, 512]:
-        x = layers.Dense(units, activation='relu')(x)
-        x = layers.BatchNormalization()(x)
-        x = layers.Dropout(config["dropout_rate"])(x)
+    # Compute ROC curve and ROC area for each class
+    fpr = dict()
+    tpr = dict()
+    roc_auc = dict()
+    
+    for i in range(num_classes):
+        fpr[i], tpr[i], _ = roc_curve(y_test[:, i], y_pred_proba[:, i])
+        roc_auc[i] = auc(fpr[i], tpr[i])
+        plt.plot(fpr[i], tpr[i], lw=2, 
+                 label=f'ROC curve for {label_map[i]} (area = {roc_auc[i]:.2f})')
+    
+    plt.plot([0, 1], [0, 1], 'k--', lw=2)
+    plt.xlim([0.0, 1.0])
+    plt.ylim([0.0, 1.05])
+    plt.xlabel('False Positive Rate')
+    plt.ylabel('True Positive Rate')
+    plt.title('Receiver Operating Characteristic (ROC) Curves')
+    plt.legend(loc="lower right")
+    plt.show()
+    
+    # Return the average AUC
+    return np.mean(list(roc_auc.values()))
 
-    outputs = layers.Dense(num_classes, activation='sigmoid')(x)
-
-    model = Model(inputs, outputs)
+# Function to create and train a custom CNN model
+def create_and_train_custom_model(X_train, y_train, X_validate, y_validate, input_shape, num_classes, epochs=20):
+    # Create a custom CNN model without requiring pretrained weights
+    model = Sequential([
+        # First convolutional block
+        Conv2D(32, (3, 3), activation='relu', padding='same', input_shape=input_shape),
+        BatchNormalization(),
+        Conv2D(32, (3, 3), activation='relu', padding='same'),
+        BatchNormalization(),
+        MaxPooling2D((2, 2)),
+        Dropout(0.1),
+        
+        # Second convolutional block
+        Conv2D(64, (3, 3), activation='relu', padding='same'),
+        BatchNormalization(),
+        Conv2D(64, (3, 3), activation='relu', padding='same'),
+        BatchNormalization(),
+        MaxPooling2D((2, 2)),
+        Dropout(0.25),
+        
+        # Third convolutional block
+        Conv2D(128, (3, 3), activation='relu', padding='same'),
+        BatchNormalization(),
+        Conv2D(128, (3, 3), activation='relu', padding='same'),
+        BatchNormalization(),
+        MaxPooling2D((2, 2)),
+        Dropout(0.1),
+        
+        # Dense layers
+        Flatten(),
+        Dense(256, activation='relu'),
+        BatchNormalization(),
+        Dropout(0.2),
+        Dense(num_classes, activation='softmax')
+    ])
     
-    # Use mixed precision optimizer
-    optimizer = tf.keras.optimizers.Adam(config["learning_rate"])
-    optimizer = mixed_precision.LossScaleOptimizer(optimizer)
-    
+    # Compile the model
     model.compile(
-        optimizer=optimizer,
-        loss='binary_crossentropy',
-        metrics=['accuracy', tf.keras.metrics.AUC()]
+        optimizer=Adam(learning_rate=0.001),
+        loss='categorical_crossentropy',
+        metrics=['accuracy']
     )
-    return model
-
-def create_generators(config: Dict, train_df: pd.DataFrame, 
-                     val_df: pd.DataFrame, test_df: pd.DataFrame, 
-                     label_columns: List[str]):
-    """Create optimized data generators."""
-    train_datagen = ImageDataGenerator(
-        preprocessing_function=tf.keras.applications.efficientnet.preprocess_input,
-        rotation_range=15,
-        width_shift_range=0.1,
-        height_shift_range=0.1,
-        horizontal_flip=True,
-        fill_mode='nearest'
-    )
-    val_datagen = ImageDataGenerator(
-        preprocessing_function=tf.keras.applications.efficientnet.preprocess_input
-    )
-
-    def flow_data(datagen, df):
-        return datagen.flow_from_dataframe(
-            df,
-            x_col='Image_Path',
-            y_col=label_columns,
-            target_size=config["img_size"],
-            batch_size=config["batch_size"],
-            class_mode='raw',
-            shuffle=True
-        )
-
-    train_gen = flow_data(train_datagen, train_df)
-    val_gen = flow_data(val_datagen, val_df)
-    test_gen = flow_data(val_datagen, test_df)
     
-    return train_gen, val_gen, test_gen
-
-def train_model(model: Model, train_gen, val_gen, config: Dict):
-    """Train the model with optimized callbacks."""
+    # Define callbacks
     callbacks = [
-        ModelCheckpoint(
-            'best_model.keras',
-            save_best_only=True,
-            monitor='val_loss',
-            verbose=1
+        ReduceLROnPlateau(
+            monitor='val_accuracy',
+            patience=3,
+            verbose=1,
+            factor=0.5,
+            min_lr=0.00001
         ),
         EarlyStopping(
             monitor='val_loss',
             patience=10,
             restore_best_weights=True,
             verbose=1
-        ),
-        ReduceLROnPlateau(
-            monitor='val_loss',
-            factor=0.5,
-            patience=5,
-            min_lr=1e-6,
-            verbose=1
         )
     ]
     
-    # Calculate steps per epoch based on dataset size and batch size
-    steps_per_epoch = len(train_gen.filenames) // config["batch_size"]
-    validation_steps = len(val_gen.filenames) // config["batch_size"]
+    # Print model summary
+    model.summary()
     
-    return model.fit(
-        train_gen,
-        validation_data=val_gen,
-        epochs=config["epochs"],
+    # Fit the model
+    history = model.fit(
+        X_train, y_train,
+        epochs=epochs,
+        batch_size=32,
+        validation_data=(X_validate, y_validate),
         callbacks=callbacks,
-        verbose=1,
-        steps_per_epoch=steps_per_epoch,
-        validation_steps=validation_steps
+        verbose=1
     )
-
-def main():
-    logging.info('Pipeline started.')
-    start_time = time.time()
-    print("\n............................................\n")
-    print("Loading configuration...")
-    config = load_config()
-    print("Configuration loaded.")
-
-    BASE_PATH = '/kaggle/input/data'
-    LABELS_PATH = os.path.join(BASE_PATH, 'Data_Entry_2017.csv')
-    DIR_NUMBERS = [f"{i:03d}" for i in range(1, 13)]
-    print("\n............................................\n")
-    print("Reading labels file...")
-    labels_df = pd.read_csv(LABELS_PATH)
-    print("Labels file loaded.")
     
-    print("\n............................................\n")
+    return model, history
 
-    print("Creating directory paths...")
-    dir_paths = create_directory_paths(BASE_PATH, DIR_NUMBERS)
-    print(f"Directory paths created: {len(dir_paths)} directories found.")
-    print("\n............................................\n")
-
-    print("Extracting image paths...")
-    image_data = get_image_paths(list(dir_paths.values()))
-    print(f"Image paths extracted: {len(image_data)} images found.")
-    print("\n............................................\n")
-
-    print("Creating DataFrame for images...")
-    image_df = pd.DataFrame(image_data, columns=['Image_Path', 'Image_Name'])
-    print("Image DataFrame created.")
-    print("\n............................................\n")
-
-    print("Processing labels...")
-    processed_df = process_labels(image_df, labels_df)
-    label_columns = [col for col in processed_df.columns if col not in ['Image_Path', 'Image_Name', 'Finding Labels']]
-    print(f"Labels processed. Total classes: {len(label_columns)}.")
-    print("\n............................................\n")
-
-    print("Displaying sample images...")
-    show_sample_images([img[0] for img in image_data])
-    print("\n............................................\n")
-
-    print("Splitting data into train, validation, and test sets...")
-    train_df, temp_df = train_test_split(processed_df, train_size=0.7, random_state=42)
-    val_df, test_df = train_test_split(temp_df, train_size=0.5, random_state=42)
-    print("Data split completed.")
-    print("\n............................................\n")
-
-    print("Building model...")
-    model = build_model(config, len(label_columns))
-    print("Model built.")
-    print("\n............................................\n")
-
-    print("Creating data generators...")
-    train_gen, val_gen, test_gen = create_generators(config, train_df, val_df, test_df, label_columns)
-    print("Data generators created.")
-
-    print("Training model...")
-    history = train_model(model, train_gen, val_gen, config)
-    print("Model training completed.")
-    print("\n............................................\n")
-
-    end_time = time.time()
-    logging.info(f'Pipeline completed successfully in {end_time - start_time:.2f} seconds.')
-    print(f"Pipeline completed successfully in {end_time - start_time:.2f} seconds.")
-    print("\n............................................\n")
+# Main execution
+def main():
+    # Define path to the dataset
+    data_dir = '/kaggle/input/curated-chest-xray-image-dataset-for-covid19/Curated X-Ray Dataset'
+    
+    # Set the maximum number of images per class for balancing
+    max_images_per_class = 1600
+    
+    # Define class mapping
+    label_map = {
+        0: "Normal",
+        1: "Pneumonia-Bacterial",
+        2: "Pneumonia-Viral"
+    }
+    
+    num_classes = len(label_map)
+    print("Label mapping:", label_map)
+    
+    # Create dataframe from the dataset
+    print("Creating dataframe from images...")
+    df = create_dataframe(data_dir)
+    
+    # Check if we have data
+    if len(df) == 0:
+        print("No valid images found in the dataset. Please check the directory structure.")
+        return
+    
+    print(f"Total images found: {len(df)}")
+    
+    # Parallelize resizing process
+    print("Resizing images...")
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+        df['image'] = list(executor.map(resize_image_array, df['image_path']))
+    
+    # Count the number of images in each class
+    class_counts = df['label'].value_counts().sort_index()
+    
+    # Print the dataset summary
+    print("\nDataset Summary")
+    print("-" * 60)
+    print(f"{'Class Label':<15} {'Class Name':<30} {'Count':<10}")
+    print("-" * 60)
+    for label, name in label_map.items():
+        count = class_counts.get(label, 0)
+        print(f"{label:<15} {name:<30} {count:<10}")
+    print("-" * 60)
+    print(f"{'Total':<45} {len(df):<10}")
+    
+    # Visualize data distribution
+    plot_data_distribution(class_counts, label_map)
+    
+    # Plot sample images
+    plot_sample_images(df, label_map)
+    
+    # Use data augmentation to balance classes
+    print("Balancing classes with data augmentation...")
+    datagen = ImageDataGenerator(
+        rotation_range=15,
+        width_shift_range=0.1,
+        height_shift_range=0.1,
+        shear_range=0.1,
+        zoom_range=0.1,
+        horizontal_flip=True,
+        fill_mode='nearest'
+    )
+    
+    # Initialize augmented DataFrame
+    augmented_df = pd.DataFrame(columns=['image_path', 'label', 'image'])
+    
+    # For each class, either sample down to max_images_per_class or augment up to it
+    for class_label in range(num_classes):
+        # Get images for this class
+        class_df = df[df['label'] == class_label]
+        class_count = len(class_df)
+        
+        if class_count == 0:
+            print(f"Warning: No images found for class {label_map[class_label]}")
+            continue
+            
+        print(f"Processing class {label_map[class_label]}: {class_count} images")
+        
+        if class_count > max_images_per_class:
+            # If we have too many, sample down
+            class_df = class_df.sample(max_images_per_class, random_state=42)
+            augmented_df = pd.concat([augmented_df, class_df], ignore_index=True)
+        else:
+            # Add all existing images
+            augmented_df = pd.concat([augmented_df, class_df], ignore_index=True)
+            
+            # If we need more, augment
+            images_needed = max_images_per_class - class_count
+            if images_needed > 0:
+                print(f"Augmenting {images_needed} more images for {label_map[class_label]}")
+                
+                # Select images to augment (with replacement if needed)
+                augment_source = class_df.sample(images_needed, replace=True)
+                
+                for _, row in augment_source.iterrows():
+                    img_array = row['image']
+                    # Need to convert grayscale to 3D array for ImageDataGenerator
+                    image_tensor = np.expand_dims(img_array, axis=0)
+                    image_tensor = np.expand_dims(image_tensor, axis=-1)
+                    
+                    # Generate an augmented image
+                    aug_img = next(datagen.flow(image_tensor, batch_size=1))[0]
+                    # Convert back to 2D array
+                    aug_img = aug_img.squeeze().astype('uint8')
+                    
+                    # Add to dataframe
+                    new_row = pd.DataFrame([{
+                        'image_path': None, 
+                        'label': class_label, 
+                        'image': aug_img
+                    }])
+                    
+                    augmented_df = pd.concat([augmented_df, new_row], ignore_index=True)
+    
+    # Update df to use the balanced dataset
+    df = augmented_df
+    
+    # Shuffle the data
+    df = df.sample(frac=1, random_state=42).reset_index(drop=True)
+    
+    # Count the balanced classes
+    balanced_counts = df['label'].value_counts().sort_index()
+    print("\nBalanced Dataset Summary")
+    print("-" * 60)
+    for label, name in label_map.items():
+        count = balanced_counts.get(label, 0)
+        print(f"{label:<15} {name:<30} {count:<10}")
+    print("-" * 60)
+    print(f"{'Total':<45} {len(df):<10}")
+    
+    # Prepare data for training
+    X = np.stack(df['image'].values)
+    y = df['label'].values
+    
+    # Split into train, validation, and test sets
+    X_train_val, X_test, y_train_val, y_test = train_test_split(X, y, test_size=0.15, stratify=y, random_state=42)
+    X_train, X_val, y_train, y_val = train_test_split(X_train_val, y_train_val, test_size=0.2, stratify=y_train_val, random_state=42)
+    
+    # Normalize images and add channel dimension
+    X_train = X_train.astype('float32') / 255.0
+    X_val = X_val.astype('float32') / 255.0
+    X_test = X_test.astype('float32') / 255.0
+    
+    # Add channel dimension for grayscale images
+    X_train = np.expand_dims(X_train, axis=-1)
+    X_val = np.expand_dims(X_val, axis=-1)
+    X_test = np.expand_dims(X_test, axis=-1)
+    
+    # One-hot encode the labels
+    y_train = to_categorical(y_train, num_classes=num_classes)
+    y_val = to_categorical(y_val, num_classes=num_classes)
+    y_test = to_categorical(y_test, num_classes=num_classes)
+    
+    # Count the number of images per class in each split
+    train_counts = np.sum(y_train, axis=0)
+    val_counts = np.sum(y_val, axis=0)
+    test_counts = np.sum(y_test, axis=0)
+    
+    # Print dataset split summary
+    print("\nDataset Split Summary")
+    print("-" * 90)
+    print(f"{'Class Label':<15} {'Class Name':<30} {'Train':<10} {'Validation':<12} {'Test':<10} {'Total':<10}")
+    print("-" * 90)
+    for label, name in label_map.items():
+        train_num = int(train_counts[label])
+        val_num = int(val_counts[label])
+        test_num = int(test_counts[label])
+        total_num = train_num + val_num + test_num
+        print(f"{label:<15} {name:<30} {train_num:<10} {val_num:<12} {test_num:<10} {total_num:<10}")
+    print("-" * 90)
+    total_images = len(y_train) + len(y_val) + len(y_test)
+    print(f"{'Total':<46} {len(y_train):<10} {len(y_val):<12} {len(y_test):<10} {total_images:<10}")
+    
+    # Define input shape (grayscale, single channel)
+    input_shape = (128, 128, 1)
+    
+    # Create and train the model
+    print("\nTraining custom CNN model...")
+    model, history = create_and_train_custom_model(
+        X_train, y_train, X_val, y_val, input_shape, num_classes, epochs=30
+    )
+    
+    # Visualize training history
+    plot_training_history(history)
+    
+    # Evaluate the model on test data
+    test_loss, test_accuracy = model.evaluate(X_test, y_test, verbose=1)
+    print(f"\nTest Accuracy: {test_accuracy:.4f}")
+    print(f"Test Loss: {test_loss:.4f}")
+    
+    # Get predictions
+    y_pred_proba = model.predict(X_test)
+    y_pred = np.argmax(y_pred_proba, axis=1)
+    y_true = np.argmax(y_test, axis=1)
+    
+    # Plot confusion matrix
+    plot_confusion_matrix(y_true, y_pred, list(label_map.values()))
+    
+    # Display classification report
+    print("\nClassification Report:")
+    class_report = classification_report(y_true, y_pred, target_names=list(label_map.values()))
+    print(class_report)
+    
+    # Plot ROC curves
+    avg_auc = plot_roc_curves(y_test, y_pred_proba, num_classes, label_map)
+    print(f"Average AUC: {avg_auc:.4f}")
+    
+    # Try to save the model
+    try:
+        model.save('./x_ray_classifier_model.h5')
+        print("Model saved successfully!")
+    except Exception as e:
+        print(f"Error saving model: {e}")
+    
+    # Function to make predictions on new images
+    def predict_image(image_path):
+        # Load and preprocess the image
+        img = resize_image_array(image_path)
+        plt.figure(figsize=(6, 6))
+        plt.imshow(img, cmap='gray')
+        plt.title("Test Image")
+        plt.axis('off')
+        plt.show()
+        
+        # Preprocess for prediction
+        img = img.astype('float32') / 255.0
+        img = np.expand_dims(img, axis=0)  # Add batch dimension
+        img = np.expand_dims(img, axis=-1)  # Add channel dimension
+        
+        # Predict
+        prediction = model.predict(img)
+        predicted_class = np.argmax(prediction, axis=1)[0]
+        predicted_label = label_map[predicted_class]
+        
+        # Show prediction
+        print(f"Predicted Class: {predicted_label}")
+        print(f"Confidence: {prediction[0][predicted_class]:.4f}")
+        
+        # Show prediction distribution
+        plt.figure(figsize=(10, 6))
+        sns.barplot(x=list(label_map.values()), y=prediction[0])
+        plt.xlabel('Classes')
+        plt.ylabel('Probability')
+        plt.title('Prediction Probability Distribution')
+        plt.tight_layout()
+        plt.show()
+    
+    # Try to predict a sample image if available
+    print("\nTrying to predict a sample image...")
+    for class_name in label_map.values():
+        class_dir = os.path.join(data_dir, class_name)
+        if os.path.exists(class_dir):
+            images = os.listdir(class_dir)
+            if images:
+                sample_path = os.path.join(class_dir, images[0])
+                print(f"Testing with sample image: {sample_path}")
+                predict_image(sample_path)
+                break
 
 if __name__ == "__main__":
     main()
